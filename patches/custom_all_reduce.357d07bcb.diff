@@ -1,0 +1,56 @@
+car_patch.py output against 1Cat-vLLM 357d07bcb (357d07bcb0ee0a3008e13900562411f2047d317a), vllm/distributed/device_communicators/custom_all_reduce.py.
+Apply from a 1Cat-vLLM checkout at exactly that revision:  git apply <this file>
+For any other revision run car_patch.py on its own custom_all_reduce.py instead.
+Derived from 1Cat-vLLM (Apache-2.0); see NOTICE.
+
+diff --git a/vllm/distributed/device_communicators/custom_all_reduce.py b/vllm/distributed/device_communicators/custom_all_reduce.py
+--- a/vllm/distributed/device_communicators/custom_all_reduce.py
++++ b/vllm/distributed/device_communicators/custom_all_reduce.py
+@@ -214,6 +214,22 @@
+         # this checks hardware and driver support for NVLink
+         assert current_platform.is_cuda_alike()
+         fully_connected = current_platform.is_fully_connected(physical_device_ids)
++        if not fully_connected and os.environ.get("VLLM_CAR_P2P_MESH") == "1":
++            # pcie-custom-allreduce: 1Cat's push kernels need only peer stores, which PCIe P2P
++            # carries (verify/car_gate.py). Every rank must agree on the path it takes.
++            local_ok = all(
++                torch.cuda.can_device_access_peer(device.index, device_ids.index(p))
++                for p in physical_device_ids
++                if p != physical_device_id
++            )
++            p2p_ok: list[bool | None] = [None] * world_size
++            dist.all_gather_object(p2p_ok, local_ok, group=self.group)
++            fully_connected = all(ok is True for ok in p2p_ok)
++            logger.info(
++                "VLLM_CAR_P2P_MESH: custom allreduce treats GPUs %s as fully connected: %s",
++                physical_device_ids,
++                fully_connected,
++            )
+         tp8_hierarchical = False
+         hierarchical_peer_ranks: tuple[int, ...] | None = None
+         if world_size > 2 and not fully_connected:
+@@ -315,6 +331,11 @@
+         self.dispatch_max_size = (
+             min(max_size, 8192 * 1024) if long_prefill_fusion_enabled else max_size
+         )
++        if os.environ.get("VLLM_CAR_MAX_BYTES"):
++            # pcie-custom-allreduce: above the push kernel's sizes the cross-root pull path loses to NCCL
++            self.dispatch_max_size = min(
++                self.dispatch_max_size, int(os.environ["VLLM_CAR_MAX_BYTES"])
++            )
+         self.rank = rank
+         self.world_size = world_size
+         self.fully_connected = fully_connected
+@@ -435,6 +456,12 @@
+             )
+         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
+         # little performance improvement over NCCL.
++        if (
++            os.environ.get("VLLM_CAR_GRAPH_ONLY") == "1"
++            and not torch.cuda.is_current_stream_capturing()
++        ):
++            # pcie-custom-allreduce: outside capture 1Cat runs pull, which loses to NCCL across PCIe
++            return False
+         if self.world_size == 2 or self.fully_connected:
+             return inp_size < self.dispatch_max_size
+         return False

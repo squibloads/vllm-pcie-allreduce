@@ -1,0 +1,16 @@
+[Unit]
+Description=Clear ACS P2P redirect on PCIe switch ports so GPU peer traffic stays in-switch
+Documentation=file:/usr/local/sbin/pex-acs-p2p.sh
+After=systemd-modules-load.service
+Before=docker.service nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# ACS_PORTS="<BDF> ..." or ACS_VENDEVS="<vendor:device> ..."; see the script's header
+EnvironmentFile=-/etc/default/pex-acs-p2p
+ExecStart=/usr/local/sbin/pex-acs-p2p.sh apply
+ExecStop=/usr/local/sbin/pex-acs-p2p.sh restore
+
+[Install]
+WantedBy=multi-user.target

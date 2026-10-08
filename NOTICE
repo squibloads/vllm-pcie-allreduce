@@ -1,0 +1,14 @@
+vllm-pcie-allreduce
+Copyright 2026 squibloads and the vllm-pcie-allreduce contributors
+
+This project modifies 1Cat-vLLM (https://github.com/1CatAI/1Cat-vLLM), a fork of vLLM
+(https://github.com/vllm-project/vllm). Both are licensed under the Apache License, Version 2.0.
+
+- patches/custom_all_reduce.357d07bcb.diff and patches/custom_all_reduce.c4f6245f8.diff are diffs
+  against vllm/distributed/device_communicators/custom_all_reduce.py of 1Cat-vLLM at those commits
+  (SPDX-FileCopyrightText: Copyright contributors to the vLLM project) and contain its context lines.
+- car_patch.py contains short excerpts of that file (its anchors) and writes a modified copy of it.
+
+The SM70 push all-reduce kernel this project enables is 1Cat-vLLM's (csrc/custom_all_reduce.cuh), which
+its source credits as adapted from the one-shot push collective of SGLang-V100
+(https://github.com/haohervchb/sglang-V100). No kernel source is included here.
