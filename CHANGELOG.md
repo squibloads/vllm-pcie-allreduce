@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0 - 2026-10-08
+
+Quality evidence for the patch on 1Cat-vLLM c4f6245f8, and the tool behind it.
+
+- `verify/teacher_forcing/`: `tf_prep.py`, `tf_run.py` and `tf_compare.py` record a reference run as token
+  IDs, re-score the same IDs on any vLLM engine with `prompt_logprobs: 20`, and compare per position
+  (abs(delta logprob), KL over the top 20, top-1 agreement, bit-identity). Stdlib only.
+  `tests/test_teacher_forcing.py` covers it without a GPU, including an end-to-end run against a toy server.
+- RESULTS.md section 7, "Quality gate (2026-10-08)": the 2+2 group with the patch is bit-identical to the
+  same group on native NCCL over PCIe on all 70,273 teacher-forced positions; both differ from four NVLink
+  GPUs by the same prefill shift (abs(delta logprob) mean 1.12e-2, KL mean 1.02e-3, top-1 98.93%);
+  1Cat's three-seed quality suite passes 108/108 on the NVLink reference, with the patch, and on native NCCL.
+- Serving: `VLLM_SM70_TOP1_CUSTOM_AR=0` is recommended on c4f6245f8 and later. Its top-1 kernel is a pull
+  kernel, which loses over PCIe; switching it off gave +0.8% decode at 6k and +1.0% at 160k with bit-identical
+  greedy output. The README's serving table and Known limits say so, and RESULTS.md section 5 now
+  points to the measurement.
+- No change to `car_patch.py`, `patches/`, the gate, `ops/` or the example.
+
 ## 0.1.0 - 2026-10-08
 
 First public release.

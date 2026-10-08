@@ -9,7 +9,8 @@ kernel needs nothing NVLink-specific: it needs CUDA peer-to-peer writes between 
 
 - `car_patch.py`, which adds three env switches to 1Cat's `custom_all_reduce.py`. With them, the group counts
   as fully connected when every pair has P2P, and only the all-reduces the push kernel covers leave NCCL;
-- `verify/`, the correctness gate we ran before trusting it;
+- `verify/`, the correctness gate we ran before trusting it, and a teacher-forced logprob comparison that
+  tells you what the whole model does with it (`verify/teacher_forcing/`);
 - `ops/`, the PCIe ACS fix the P2P path needs;
 - the measurements, in [RESULTS.md](RESULTS.md).
 
@@ -49,8 +50,16 @@ One all-reduce, 2+2 group across the CPU root complex, captured in a CUDA graph 
 
 - On 1Cat-vLLM c4f6245f8 (2026-10-08): 90.4 and 90.9 tok/s at 6k across PCIe, against 95.1 and 95.5 on four
   NVLink GPUs.
-- Greedy outputs drift from NCCL's as much as custom AR on NVLink already drifts from NCCL. GSM8K: 194/200 with
-  NCCL, 194/200 with this patch.
+- **Quality, teacher-forced** (c4f6245f8, [RESULTS.md](RESULTS.md) section 7): scored on identical token
+  sequences, the 2+2 group with this patch is bit-identical to the same group on native NCCL over PCIe on all
+  70,273 positions. Against four NVLink GPUs both arms show the same shift: abs(delta logprob) mean 1.12e-2,
+  p95 5.63e-2, max 0.409; KL(top-20) mean 1.02e-3; top-1 agreement 98.93% on completion positions. It comes
+  from NCCL's fp16 hops against the NVLink group's fp32-accumulating custom AR in prefill, not from the
+  kernel. Teacher forcing scores in prefill, where the push kernel does not run, so it shows the patch leaves
+  prefill untouched. The decode kernel itself is covered by the gate, by free-running greedy text, and by
+  1Cat's three-seed quality suite: 108/108 on the NVLink reference, with this patch and on native NCCL.
+- Earlier, on 357d07bcb, greedy outputs drifted from NCCL's as much as custom AR on NVLink already drifts from
+  NCCL. GSM8K: 194/200 with NCCL, 194/200 with this patch.
 
 ## How it works
 
@@ -203,6 +212,16 @@ scores. A broken P2P path more often hangs CUDA-graph capture or the first reque
 
 Our 2+2 group passed every check, before and after we added a PCIe switch ([RESULTS.md](RESULTS.md) section 2).
 
+### Teacher-forced logprob check
+
+The gate proves the all-reduce exact; [`verify/teacher_forcing/`](verify/teacher_forcing/README.md) measures
+the model. It records a reference run as token IDs (`tf_prep.py`), re-scores the same IDs on each engine with
+`prompt_logprobs: 20` (`tf_run.py`), and compares per position (`tf_compare.py`): abs(delta logprob), KL over
+the top 20, top-1 agreement, and how many positions are bit-identical. Serve the reference layout, then the
+patched and unpatched candidates on the same GPUs, and compare them. Stdlib only, against vLLM's
+OpenAI-compatible server. It scores in prefill, so it checks that the patch leaves prefill alone and measures
+the layout's own shift; it does not run the push kernel.
+
 ## Serving
 
 [`examples/docker-run.sh`](examples/docker-run.sh) is the launch, with `IMG`, `GPUS`, `MODEL_DIR` and `PATCH`
@@ -214,6 +233,7 @@ as placeholders.
 | `VLLM_CAR_MAX_BYTES` | `81921` | custom AR only below 81921 bytes; the push kernel stops at 81920 |
 | `VLLM_CAR_GRAPH_ONLY` | `1` | custom AR only inside CUDA graphs; 1Cat's eager path is the pull kernel |
 | `NCCL_P2P_LEVEL` | `SYS` | NCCL keeps the large all-reduces; let it use P2P across root ports |
+| `VLLM_SM70_TOP1_CUSTOM_AR` | `0` (c4f6245f8 and later) | greedy top-1 is a pull kernel, which loses over PCIe; this keeps it on NCCL (`TOP1_CUSTOM_AR=0` in the example) |
 | `VLLM_TP_ALLREDUCE_TRACE` | `1` (optional) | log the backend of each all-reduce shape, once per shape |
 | `--tensor-parallel-size` | `4` | the push kernel is TP=4 only |
 
@@ -261,9 +281,10 @@ expected, because vLLM's registry does not know the patch's switches.
     models with hidden size 5120, the fused all-reduce + RMSNorm push.
 
   `verify_car.sh` tests the plain all-reduce only. For the rest our evidence is end-to-end
-  ([RESULTS.md](RESULTS.md) section 6, with `VLLM_SM70_QWEN38_FUSED_HC_FP16=1` in every run): outputs within
-  the drift custom AR already has on NVLink, GSM8K unchanged. `VLLM_SM70_TOP1_CUSTOM_AR=0`
-  (`TOP1_CUSTOM_AR=0` in the example) keeps top-1 on NCCL; we have not measured what that does to speed.
+  ([RESULTS.md](RESULTS.md) sections 6 and 7, with `VLLM_SM70_QWEN38_FUSED_HC_FP16=1` in every run): outputs
+  within the drift custom AR already has on NVLink, GSM8K unchanged, 1Cat's quality suite 108/108.
+  `VLLM_SM70_TOP1_CUSTOM_AR=0` (`TOP1_CUSTOM_AR=0` in the example) keeps top-1 on NCCL. It gave +0.8% decode
+  at 6k and +1.0% at 160k with TTFT unchanged, and greedy tokens and logprobs bit-identical to leaving it on.
 - **Correctness is per box.** We gated V100-SXM2 on PCIe carrier boards behind PLX/Broadcom switches and a
   Zen 2 root complex. Other boards, switches and root complexes need their own gate run.
 - **1Cat revisions move.** `car_patch.py` was checked against 357d07bcb and c4f6245f8 and refuses files whose

@@ -116,11 +116,11 @@ file.
 | TTFT at 160k (s) | 36.8 | 46.4 |
 | KV cache (tokens) | 455,703 | 466,372 |
 
-- No 2+2 NCCL arm was run on this image.
+- No 2+2 NCCL arm was timed on this image; the NCCL arm in section 7 was run for quality only.
 - The decode gap to the NVLink board grew from 2.1% (357d07bcb: 91.5 vs 93.5) to 4.9%. 1Cat-vLLM #821, which
   landed between the two images, made `VLLM_SM70_TOP1_CUSTOM_AR=1` the default. With the group counted as
-  fully connected, greedy top-1 then goes through a custom-AR pull kernel across PCIe. That is the first
-  suspect; it has not been isolated.
+  fully connected, greedy top-1 then goes through a custom-AR pull kernel across PCIe. That was the first
+  suspect; section 7 isolated it, and switching it off recovers about 1%.
 - TTFT at 160k is 26% longer than on the NVLink board (357d07bcb: 20%). c4f6245f8 prefills in larger steps,
   and the NVLink board sends their 8 MB all-reduces through custom AR, while across PCIe they stay on NCCL;
   whether that is the whole gap is open.
@@ -155,4 +155,106 @@ long prompts (2.5k-6k tokens, 192 output tokens), 1 of 16 identical, first diver
 mean abs(delta logprob) before it 9.2e-3. At every divergence the two candidate tokens are within 0.19 nats
 of each other.
 
-Not covered: 1Cat's official-sampling quality gate, and a teacher-forced (per-token KL) comparison.
+1Cat's own quality suite and a teacher-forced (per-token KL) comparison are in section 7.
+
+## 7. Quality gate (2026-10-08)
+
+c4f6245f8, after the Gen4 switch, one engine launch per arm, the same serving configuration in all three:
+
+- **NVLink reference:** the four NVLink GPUs of board A, custom AR as 1Cat ships it.
+- **2+2, custom AR:** this repo's patch, the 2+2 group across the boards.
+- **2+2, NCCL:** the same 2+2 group, unpatched: every all-reduce on NCCL over PCIe.
+
+Four checks: 1Cat's own quality suite, teacher-forced logprobs, free-running greedy text, and the greedy top-1
+switch.
+
+### 1Cat's quality suite
+
+1Cat-vLLM's Qwen3.8 quality gate (`benchmarks/benchmark_sm70_qwen38_quality.py`), with its own prompts, scoring
+and health checks: three seeds, temperature 1.0, top-p 0.95, top-k 20, up to 4096 tokens, natural EOS. The
+script loads its own engine and strips every `VLLM_*` variable, which would remove this patch's switches, so the
+generations went over HTTP to the served arms and the scoring used the gate's functions unchanged.
+
+| Generations passed | NVLink reference | 2+2, custom AR | 2+2, NCCL |
+|---|---|---|---|
+| MBPP (36) | 36/36 | 36/36 | 36/36 |
+| GSM8K (36) | 36/36 | 36/36 | 36/36 |
+| Chinese (24) | 24/24 | 24/24 | 24/24 |
+| Needle, 8k / 32k / 131k / 258k (12) | 12/12 | 12/12 | 12/12 |
+| **Total (108)** | **108/108** | **108/108** | **108/108** |
+| Unhealthy outputs (no natural EOS, empty answer, replacement characters, repeated answer line) | 0 | 0 | 0 |
+| `compare_quality` against the NVLink reference | - | pass | pass |
+
+### Teacher-forced logprobs
+
+16 prompts of 2.5k-6k tokens, each followed by the NVLink reference's own 192 greedy tokens: 70,273 scored
+positions, 3,072 of them completion tokens and 67,201 prompt tokens. Every arm scored the same token IDs with
+`prompt_logprobs: 20`, one request at a time (`verify/teacher_forcing/`). "NVLink, scored again" is the
+reference engine a second time; "NVLink, relaunched" is the same layout in a fresh engine launch.
+
+| Arm | Positions | abs(delta logprob) mean / p95 / max | KL(top-20) mean / p95 / max | Top-1 agreement |
+|---|---|---|---|---|
+| NVLink, scored again | completion | 0 / 0 / 0 | 0 / 0 / 0 | 100% |
+| NVLink, relaunched | completion | 0 / 0 / 0 | 0 / 0 / 0 | 100% |
+| **2+2, custom AR** | completion | 1.12e-2 / 5.63e-2 / 0.409 | 1.02e-3 / 4.21e-3 / 8.72e-2 | 98.93% (33 of 3,072 differ) |
+| **2+2, NCCL** | completion | 1.12e-2 / 5.63e-2 / 0.409 | 1.02e-3 / 4.21e-3 / 8.72e-2 | 98.93% (33 of 3,072 differ) |
+| NVLink, scored again and relaunched | prompt | 0 / 0 / 0 | 0 / 0 / 0 | 100% |
+| **2+2, custom AR** | prompt | 1.22e-1 / 0.599 / 13.4 | 3.10e-2 / 7.81e-2 / 10.7 | 95.83% (2,801 of 67,201 differ) |
+| **2+2, NCCL** | prompt | 1.22e-1 / 0.599 / 13.4 | 3.10e-2 / 7.81e-2 / 10.7 | 95.83% (2,801 of 67,201 differ) |
+
+KL is taken over the reference's top-20 distribution plus one bucket for the rest of the mass, in nats: a lower
+bound on the full-vocabulary KL.
+
+- **The patch changes nothing the model can see in prefill.** The 2+2 custom AR arm is bit-identical to the 2+2
+  NCCL arm on all 70,273 positions: the same figures to the last digit, the same position of the largest KL.
+  Scoring a prompt is a prefill. Its all-reduces are 120 KiB to 10 MiB, above the push kernel's 80 KiB, and
+  `VLLM_CAR_GRAPH_ONLY=1` keeps custom AR to captured decode graphs, so every one of them runs on NCCL with or
+  without the patch. The push kernel does not run in this measurement; it is covered by the gate
+  (`verify_car.sh`), by the free-running comparison below, and by the quality suite above.
+- **The shift against the NVLink reference is the layout's.** Both 2+2 arms sit 1.12e-2 mean and 5.63e-2 p95
+  from the reference in abs(delta logprob) (max 0.409), at KL 1.02e-3 mean, 4.21e-3 p95 and 8.72e-2 max, with
+  top-1 agreement of 98.93% on completion positions. We attribute it to prefill rounding. On the NVLink group
+  the multi-MiB prefill all-reduces go through custom AR, which accumulates in fp32 and rounds once. Across
+  PCIe they stay on NCCL, which rounds to fp16 at each hop. The arm without the patch has the same shift, so
+  the push kernel is not its source.
+- **The control is exact.** Scoring the reference engine again, and the same layout in a fresh launch, gives
+  zero on every figure, so these differences are not run-to-run noise.
+
+### Free-running greedy text
+
+16 prompts of 2.5k-6k tokens, 192 greedy tokens each. Decode runs in captured graphs here, so the push kernel
+does run. First divergence is the first token that differs; an identical completion counts as 192.
+
+| Pair | Identical | First divergence, median (q1-q3) | Mean abs(delta logprob) before it |
+|---|---|---|---|
+| NVLink reference vs the same layout relaunched | 16/16 | token 192 | 0 |
+| NVLink reference vs 2+2, custom AR | 1/16 | token 48 (8-92) | 9.21e-3 |
+| NVLink reference vs 2+2, NCCL | 1/16 | token 48 (8-124) | 1.03e-2 |
+| 2+2, NCCL vs 2+2, custom AR | 4/16 | token 168 (64-191) | 4.75e-3 |
+
+Both 2+2 arms leave the NVLink reference at the same median, token 48. The teacher-forced table points at the
+prefill: both start from the same shifted state. The two 2+2 arms stay together more than three times as long,
+median token 168. They share that prefill, so what separates them is decode: the push kernel's fp32 sum against
+NCCL's fp16 hops. At every divergence from the reference, the two candidate tokens are within 0.2 nats of each
+other (largest 0.191).
+
+A decode probe with one-token prompts, meant to isolate the decode path, left the NVLink reference at token 0
+or 1 on every 2+2 arm, the NCCL arm included, so it does not separate the kernel from the layout and is not
+used here.
+
+### Greedy top-1 on c4f6245f8
+
+1Cat-vLLM's greedy top-1 custom all-reduce (`VLLM_SM70_TOP1_CUSTOM_AR`, on by default since #821) is a pull
+kernel, which loses over PCIe. Switching it off on the 2+2 group, custom AR otherwise as before:
+
+| 2+2, custom AR | top-1 on | top-1 off | Change |
+|---|---|---|---|
+| decode at 6k, two requests (tok/s) | 90.96 / 91.51 | 91.54 / 92.38 | +0.8% |
+| decode at 160k (tok/s) | 78.51 | 79.26 | +1.0% |
+| TTFT at 160k (s) | 43.00 | 43.07 | unchanged |
+
+Greedy tokens and logprobs are bit-identical with it on and off (16 of 16 completions, mean abs(delta logprob)
+0). This pair ran on a configuration whose cross-board NCCL transport differs from the rest of this section,
+which is why its TTFT is lower than section 5's 46.4 s; read the change within the pair, not the absolute
+figures. The pull kernel costs about 1% of decode here. The gap to the NVLink board widened from 2.1% to
+4.9% between the two images (section 5), 2.8 points, of which it explains about one.
